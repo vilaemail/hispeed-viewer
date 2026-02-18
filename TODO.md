@@ -1,0 +1,8 @@
+- Allow opening files without json file description. For these autogenerate json and ask for minimal user info such as fps.
+- Create schema for json format and validate it.
+- Add file->open option to just import a single mp4 file (with or without JSON present).
+- Support non-Windows development and generate releases for non-Windows OSes.
+- Thorough testing, edge cases handling and error handling.
+- Take into account DPI scaling (if it makes sense)
+- Overlay not in right place when zooming in.
+- Do not show command line when opening app.

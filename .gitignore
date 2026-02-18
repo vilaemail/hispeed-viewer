@@ -1,0 +1,26 @@
+/target
+
+# App runtime directories
+/temp
+/completed
+/cache
+
+# Release artifacts
+/release
+
+# Signing
+/signing/*.pfx
+/signing/*.p12
+
+# Settings (user-specific)
+settings.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
