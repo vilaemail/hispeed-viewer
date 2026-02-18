@@ -29,6 +29,7 @@ pub fn render_timeline(
     total_frames: u32,
     metadata: Option<&VideoMetadata>,
     cache_status: &dyn Fn(u32) -> bool,
+    cached_frames: u32,
     time_format: TimeFormat,
     state: &mut TimelineState,
     offset_seconds: f64,
@@ -416,14 +417,19 @@ pub fn render_timeline(
 
     // Info text (between bar and scrollbar)
     let text_y = scrollbar_rect.top() - 2.0;
+    let info_font = egui::FontId::monospace(11.0);
+    let info_color = egui::Color32::from_gray(180);
+
+    // Left: frame position
     painter.text(
         egui::pos2(rect.left() + 4.0, text_y),
         egui::Align2::LEFT_BOTTOM,
         format!("Frame: {} / {}", current_frame + 1, total_frames),
-        egui::FontId::monospace(11.0),
-        egui::Color32::from_gray(180),
+        info_font.clone(),
+        info_color,
     );
 
+    // Right: time position
     if let Some(meta) = metadata {
         let time = meta.frame_to_time(current_frame) + offset_seconds;
         let duration = meta.total_duration();
@@ -435,18 +441,26 @@ pub fn render_timeline(
                 VideoMetadata::format_time(time, time_format),
                 VideoMetadata::format_time(duration, time_format)
             ),
-            egui::FontId::monospace(11.0),
-            egui::Color32::from_gray(180),
+            info_font.clone(),
+            info_color,
         );
     }
 
-    // Zoom indicator (when zoomed in)
-    if is_zoomed {
-        let zoom_text = format!("{:.0}x", state.zoom);
+    // Center: cached frames count + zoom indicator
+    {
+        let pct = if total_frames > 0 {
+            cached_frames as f32 / total_frames as f32 * 100.0
+        } else {
+            0.0
+        };
+        let mut center_text = format!("Cached: {}/{} ({:.0}%)", cached_frames, total_frames, pct);
+        if is_zoomed {
+            center_text = format!("{:.0}x  {}", state.zoom, center_text);
+        }
         painter.text(
             egui::pos2(rect.center().x, text_y),
             egui::Align2::CENTER_BOTTOM,
-            zoom_text,
+            center_text,
             egui::FontId::monospace(9.0),
             egui::Color32::from_gray(120),
         );

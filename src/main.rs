@@ -6,6 +6,14 @@ mod sync;
 mod ui;
 mod video;
 
+// Force discrete GPU selection for NVIDIA/AMD drivers (affects OpenGL rendering)
+#[cfg(target_os = "windows")]
+#[no_mangle]
+pub static NvOptimusEnablement: u32 = 1;
+#[cfg(target_os = "windows")]
+#[no_mangle]
+pub static AmdPowerXpressRequestHighPerformance: i32 = 1;
+
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
@@ -16,7 +24,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("HiSpeed Viewer")
-            .with_inner_size([1280.0, 800.0])
+            .with_inner_size([1800.0, 800.0])
             .with_min_inner_size([800.0, 600.0]),
         ..Default::default()
     };

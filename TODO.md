@@ -1,3 +1,4 @@
+- Generate and use thumbnails to allow fast scrubbing until full resolution image loads.
 - Allow opening files without json file description. For these autogenerate json and ask for minimal user info such as fps.
 - Create schema for json format and validate it.
 - Add file->open option to just import a single mp4 file (with or without JSON present).
@@ -6,3 +7,7 @@
 - Take into account DPI scaling (if it makes sense)
 - Overlay not in right place when zooming in.
 - Do not show command line when opening app.
+- Allow opening large files (do not require whole cache to be on disk while file is open).
+- BC1 and BC7 are not "compression" methods on disk but rather "runtime" compression when putting into GPU, this allows reusing same cache for different picture quality dynamically in UI. This should be optional as it possibly is a non-trivial trade off (need to test this assumption) between processing time when loading frames into GPU.
+- Investigate large files and break them up to improve readability and addition of new features.
+- Fix all warnings and make warnings fail build.

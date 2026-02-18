@@ -1,5 +1,6 @@
-use crate::settings::{Settings, SourceType};
+use crate::settings::{CacheStorageMode, CompressionAlgorithm, CompressionDevice, Settings, SourceType};
 use crate::ui::setting_widgets;
+use crate::video::gpu_device::GpuAvailability;
 use std::path::{Path, PathBuf};
 
 /// Describes a pending folder move when the user changes a storage path.
@@ -10,6 +11,27 @@ pub struct PendingFolderMove {
     pub has_files: bool,
 }
 
+/// Which benchmark mode the user selected.
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum BenchmarkMode {
+    #[default]
+    CurrentSettings,
+    SmallSubset,
+    All,
+}
+
+impl BenchmarkMode {
+    pub const ALL: &[BenchmarkMode] = &[Self::CurrentSettings, Self::SmallSubset, Self::All];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::CurrentSettings => "Current Settings",
+            Self::SmallSubset => "Small Subset",
+            Self::All => "All Combinations",
+        }
+    }
+}
+
 /// State for the settings validation/move-confirmation dialog.
 #[derive(Default)]
 pub struct SettingsValidationState {
@@ -17,6 +39,7 @@ pub struct SettingsValidationState {
     pub showing_validation: bool,
     pub pending_moves: Vec<PendingFolderMove>,
     pub showing_moves: bool,
+    pub selected_benchmark_mode: BenchmarkMode,
 }
 
 /// Action returned by the settings window.
@@ -25,6 +48,8 @@ pub enum SettingsAction {
     None,
     /// User wants to save (validated OK or chose "Save Anyway").
     Save,
+    /// User wants to run a benchmark.
+    Benchmark(BenchmarkMode),
 }
 
 /// Render the settings window.
@@ -35,10 +60,15 @@ pub fn render_settings(
     old_settings: &Settings,
     exe_dir: &Path,
     validation: &mut SettingsValidationState,
+    gpu_availability: &GpuAvailability,
 ) -> SettingsAction {
     let mut action = SettingsAction::None;
 
     egui::ScrollArea::vertical().show(ui, |ui| {
+    egui::Frame::NONE
+        .inner_margin(egui::Margin { left: 8, right: 16, top: 4, bottom: 8 })
+        .show(ui, |ui| {
+
     ui.heading("Settings");
     ui.separator();
 
@@ -135,6 +165,165 @@ pub fn render_settings(
         ui.add(egui::DragValue::new(&mut settings.gpu_cache_mb).range(64..=16384).speed(50));
     });
 
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label("Compression:");
+
+    // Algorithm dropdown
+    ui.horizontal(|ui| {
+        ui.label("Algorithm:");
+        egui::ComboBox::from_id_salt("compression_algo")
+            .selected_text(settings.compression_algorithm.label())
+            .show_ui(ui, |ui| {
+                for &algo in CompressionAlgorithm::ALL {
+                    ui.selectable_value(&mut settings.compression_algorithm, algo, algo.label());
+                }
+            });
+    });
+
+    // Auto-clamp level when algorithm changes
+    if !settings.compression_algorithm.levels().contains(&settings.compression_level) {
+        settings.compression_level = settings.compression_algorithm.default_level();
+    }
+
+    // Force CompressedOnly when GPU-compressed algorithm is selected
+    // (BC has no raw RGBA representation, so Both and RawOnly are invalid)
+    if settings.compression_algorithm.is_gpu_compressed()
+        && settings.cache_storage_mode != CacheStorageMode::CompressedOnly
+    {
+        settings.cache_storage_mode = CacheStorageMode::CompressedOnly;
+    }
+
+    // Compression level dropdown (algorithm-specific)
+    ui.horizontal(|ui| {
+        ui.label("Compression Level:");
+        let levels = settings.compression_algorithm.levels();
+        let level_count = *levels.end() - *levels.start() + 1;
+        if level_count <= 1 {
+            ui.label("Default");
+        } else {
+            egui::ComboBox::from_id_salt("compression_level")
+                .selected_text(settings.compression_algorithm.level_label(settings.compression_level))
+                .show_ui(ui, |ui| {
+                    for lvl in levels {
+                        ui.selectable_value(
+                            &mut settings.compression_level,
+                            lvl,
+                            settings.compression_algorithm.level_label(lvl),
+                        );
+                    }
+                });
+        }
+    });
+
+    // Compression device dropdown (only relevant for BC1/BC7)
+    let is_bc = settings.compression_algorithm.is_gpu_compressed();
+    ui.horizontal(|ui| {
+        ui.label("Compression Device:");
+        if is_bc {
+            // Auto-fallback: if selected device is unavailable, resolve to best
+            if !gpu_availability.is_available(settings.compression_device) {
+                settings.compression_device = gpu_availability.best_fallback(settings.compression_device);
+            }
+            egui::ComboBox::from_id_salt("compression_device")
+                .selected_text(settings.compression_device.label())
+                .show_ui(ui, |ui| {
+                    for &device in CompressionDevice::ALL {
+                        let available = gpu_availability.is_available(device);
+                        ui.add_enabled_ui(available, |ui| {
+                            let resp = ui.selectable_value(
+                                &mut settings.compression_device,
+                                device,
+                                device.label(),
+                            );
+                            if !available {
+                                resp.on_disabled_hover_text("No compatible adapter detected");
+                            }
+                        });
+                    }
+                });
+        } else {
+            ui.colored_label(
+                egui::Color32::from_gray(140),
+                format!("(N/A for {})", settings.compression_algorithm.label()),
+            );
+        }
+    });
+
+    // Warnings for BC compression
+    if settings.compression_algorithm.is_gpu_compressed() {
+        ui.label(
+            egui::RichText::new("BC1/BC7 are lossy compressions.")
+                .small()
+                .color(egui::Color32::from_gray(140)),
+        );
+        if settings.compression_algorithm == CompressionAlgorithm::Bc7 {
+            match settings.compression_level {
+                3 | 4 => {
+                    ui.label(
+                        egui::RichText::new("This quality level is extremely slow!")
+                            .small()
+                            .color(egui::Color32::from_rgb(220, 60, 60)),
+                    );
+                }
+                2 => {
+                    ui.label(
+                        egui::RichText::new("This quality level is very slow.")
+                            .small()
+                            .color(egui::Color32::from_rgb(220, 180, 40)),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Storage mode dropdown
+    ui.horizontal(|ui| {
+        ui.label("Cache Storage Mode:");
+        egui::ComboBox::from_id_salt("cache_storage_mode")
+            .selected_text(settings.cache_storage_mode.label())
+            .show_ui(ui, |ui| {
+                for &mode in CacheStorageMode::ALL {
+                    let enabled = !(is_bc && mode != CacheStorageMode::CompressedOnly);
+                    ui.add_enabled_ui(enabled, |ui| {
+                        let resp = ui.selectable_value(&mut settings.cache_storage_mode, mode, mode.label());
+                        if !enabled {
+                            resp.on_disabled_hover_text("BC1/BC7 textures are GPU-native and have no raw format");
+                        }
+                    });
+                }
+            });
+    });
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label("Benchmark:");
+
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("benchmark_mode")
+            .selected_text(validation.selected_benchmark_mode.label())
+            .show_ui(ui, |ui| {
+                for &mode in BenchmarkMode::ALL {
+                    ui.selectable_value(&mut validation.selected_benchmark_mode, mode, mode.label());
+                }
+            });
+        if ui.button("Run").clicked() {
+            action = SettingsAction::Benchmark(validation.selected_benchmark_mode);
+        }
+    });
+
+    let desc = match validation.selected_benchmark_mode {
+        BenchmarkMode::CurrentSettings => "Tests the saved compression settings on the first recording.",
+        BenchmarkMode::SmallSubset => "Tests LZ4, PNG 0/3, Zstd 1/3, BC1, BC7. GPU adds extra BC7 levels.",
+        BenchmarkMode::All => "Tests every algorithm and level (39 runs).",
+    };
+    ui.label(
+        egui::RichText::new(desc)
+            .small()
+            .color(egui::Color32::from_gray(140)),
+    );
+
     ui.add_space(16.0);
     ui.separator();
 
@@ -209,6 +398,8 @@ pub fn render_settings(
             action = SettingsAction::Save;
         }
     }
+
+    }); // Frame
     }); // ScrollArea
 
     action

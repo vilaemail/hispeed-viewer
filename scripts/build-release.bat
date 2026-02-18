@@ -78,6 +78,12 @@ if %SIGN_RESULT% neq 0 (
     goto :cleanup
 )
 
+:: Copy settings.json to output directories if it exists at repo root
+if exist "settings.json" (
+    copy /y "settings.json" "target\release\settings.json" >nul
+    copy /y "settings.json" "release\settings.json" >nul
+)
+
 echo.
 echo === Build successful ===
 echo EXE: %EXE%

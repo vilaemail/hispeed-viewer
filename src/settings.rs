@@ -10,6 +10,9 @@ pub struct VideoSettings {
     pub overlay_x: f32,
     #[serde(default = "default_overlay_y")]
     pub overlay_y: f32,
+    /// Custom display name for this recording. `None` = use original filename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 impl VideoSettings {
@@ -83,6 +86,161 @@ impl ViewerMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompressionAlgorithm {
+    Lz4,
+    Zstd,
+    Png,
+    Bc1,
+    Bc7,
+}
+
+impl Default for CompressionAlgorithm {
+    fn default() -> Self {
+        Self::Zstd
+    }
+}
+
+impl CompressionAlgorithm {
+    pub const ALL: &[CompressionAlgorithm] = &[Self::Lz4, Self::Zstd, Self::Png, Self::Bc1, Self::Bc7];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Lz4 => "LZ4",
+            Self::Zstd => "Zstandard",
+            Self::Png => "PNG",
+            Self::Bc1 => "BC1 (GPU)",
+            Self::Bc7 => "BC7 (GPU)",
+        }
+    }
+
+    /// Valid compression levels for this algorithm.
+    pub fn levels(&self) -> std::ops::RangeInclusive<u32> {
+        match self {
+            Self::Lz4 => 0..=0,
+            Self::Zstd => 1..=22,
+            Self::Png => 0..=9,
+            Self::Bc1 => 0..=0,
+            Self::Bc7 => 0..=4,
+        }
+    }
+
+    pub fn default_level(&self) -> u32 {
+        match self {
+            Self::Lz4 => 0,
+            Self::Zstd => 3,
+            Self::Png => 6,
+            Self::Bc1 => 0,
+            Self::Bc7 => 1,
+        }
+    }
+
+    pub fn level_label(&self, level: u32) -> String {
+        match self {
+            Self::Lz4 => "Default".to_string(),
+            Self::Zstd => format!("Level {level}"),
+            Self::Png => format!("Level {level}"),
+            Self::Bc1 => "Default".to_string(),
+            Self::Bc7 => match level {
+                0 => "Ultra Fast".to_string(),
+                1 => "Very Fast".to_string(),
+                2 => "Fast".to_string(),
+                3 => "Basic".to_string(),
+                4 => "Slow".to_string(),
+                _ => format!("Level {level}"),
+            },
+        }
+    }
+
+    /// Whether this algorithm produces GPU-native compressed textures.
+    pub fn is_gpu_compressed(&self) -> bool {
+        matches!(self, Self::Bc1 | Self::Bc7)
+    }
+
+    /// Bytes consumed on GPU per frame for this algorithm.
+    pub fn gpu_frame_bytes(&self, width: u32, height: u32) -> u64 {
+        match self {
+            Self::Bc1 => {
+                let bw = (width as u64 + 3) / 4;
+                let bh = (height as u64 + 3) / 4;
+                bw * bh * 8
+            }
+            Self::Bc7 => {
+                let bw = (width as u64 + 3) / 4;
+                let bh = (height as u64 + 3) / 4;
+                bw * bh * 16
+            }
+            _ => width as u64 * height as u64 * 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompressionDevice {
+    Cpu,
+    Igpu,
+    Gpu,
+}
+
+impl Default for CompressionDevice {
+    fn default() -> Self {
+        Self::Gpu
+    }
+}
+
+impl CompressionDevice {
+    pub const ALL: &[CompressionDevice] = &[Self::Cpu, Self::Igpu, Self::Gpu];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Igpu => "Integrated GPU",
+            Self::Gpu => "Discrete GPU",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CacheStorageMode {
+    CompressedOnly,
+    RawOnly,
+    Both,
+}
+
+impl Default for CacheStorageMode {
+    fn default() -> Self {
+        Self::CompressedOnly
+    }
+}
+
+impl CacheStorageMode {
+    pub const ALL: &[CacheStorageMode] = &[Self::CompressedOnly, Self::RawOnly, Self::Both];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::CompressedOnly => "Compressed Only",
+            Self::RawOnly => "Raw Only",
+            Self::Both => "Both (Compressed + Raw)",
+        }
+    }
+
+    pub fn store_compressed(&self) -> bool {
+        matches!(self, Self::CompressedOnly | Self::Both)
+    }
+
+    pub fn store_raw(&self) -> bool {
+        matches!(self, Self::RawOnly | Self::Both)
+    }
+
+    pub fn load_raw_first(&self) -> bool {
+        matches!(self, Self::RawOnly | Self::Both)
+    }
+
+    pub fn load_compressed(&self) -> bool {
+        matches!(self, Self::CompressedOnly | Self::Both)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimeFormat {
     Milliseconds,
     Microseconds,
@@ -143,6 +301,14 @@ pub struct Settings {
     pub filmstrip_after_count: u32,
     #[serde(default = "default_filmstrip_center_percent")]
     pub filmstrip_center_percent: u32,
+    #[serde(default)]
+    pub compression_algorithm: CompressionAlgorithm,
+    #[serde(default = "default_compression_level")]
+    pub compression_level: u32,
+    #[serde(default)]
+    pub cache_storage_mode: CacheStorageMode,
+    #[serde(default)]
+    pub compression_device: CompressionDevice,
 }
 
 fn default_http_url() -> String {
@@ -190,6 +356,9 @@ fn default_disk_cache_mb() -> u32 {
 fn default_gpu_cache_mb() -> u32 {
     8192
 }
+fn default_compression_level() -> u32 {
+    3
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -212,6 +381,10 @@ impl Default for Settings {
             filmstrip_before_count: default_filmstrip_before_count(),
             filmstrip_after_count: default_filmstrip_after_count(),
             filmstrip_center_percent: default_filmstrip_center_percent(),
+            compression_algorithm: CompressionAlgorithm::default(),
+            compression_level: default_compression_level(),
+            cache_storage_mode: CacheStorageMode::default(),
+            compression_device: CompressionDevice::default(),
         }
     }
 }

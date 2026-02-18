@@ -40,6 +40,25 @@ pub fn run_process(executable: &str, args: &[&str]) -> Result<SubprocessResult, 
         .map_err(|e| format!("Failed to run {executable}: {e}"))
 }
 
+/// Open a folder in the OS file explorer.
+pub fn open_folder(path: &Path) {
+    if !path.exists() {
+        let _ = std::fs::create_dir_all(path);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::open_folder(path);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
 // --- Performance monitoring ---
 
 /// Process performance statistics.
@@ -79,6 +98,8 @@ pub struct PerfMonitor {
     last_disk_refresh: Instant,
     cached_video_dir_size: u64,
     cached_cache_dir_size: u64,
+    // GPU usage tracker (Windows PDH)
+    gpu_tracker: windows::GpuUsageTracker,
 }
 
 impl PerfMonitor {
@@ -115,6 +136,7 @@ impl PerfMonitor {
             last_disk_refresh: Instant::now(),
             cached_video_dir_size: 0,
             cached_cache_dir_size: 0,
+            gpu_tracker: windows::GpuUsageTracker::new(std::process::id()),
         }
     }
 
@@ -173,8 +195,8 @@ impl PerfMonitor {
                 self.perf.total_memory_mb = mem_mb + avail_mb;
             }
 
-            // GPU: platform-specific
-            self.perf.gpu_percent = windows::gpu_usage_percent();
+            // GPU: utilization via PDH, memory via DXGI
+            self.perf.gpu_percent = self.gpu_tracker.sample();
             if let Some((used, budget)) = windows::gpu_memory_info() {
                 self.perf.gpu_memory_mb = Some(used);
                 self.perf.gpu_total_mb = Some((self.gpu_cache_mb as f32).min(budget));

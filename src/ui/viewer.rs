@@ -1,4 +1,5 @@
 use crate::settings::{TimeFormat, ViewerMode};
+use crate::video::cache::FrameTexture;
 use crate::video::metadata::VideoMetadata;
 
 pub struct ViewerAction {
@@ -44,7 +45,7 @@ impl ViewerZoomState {
 /// Render the main frame viewer panel.
 pub fn render_viewer(
     ui: &mut egui::Ui,
-    current_texture: Option<&egui::TextureHandle>,
+    current_texture: Option<&FrameTexture>,
     current_frame_missing: bool,
     current_frame: u32,
     total_frames: u32,
@@ -52,7 +53,7 @@ pub fn render_viewer(
     offset_seconds: f64,
     overlay_pos: &mut egui::Pos2,
     viewer_mode: ViewerMode,
-    neighbor_textures: &[(u32, Option<egui::TextureHandle>, bool)],
+    neighbor_textures: &[(u32, Option<FrameTexture>, bool)],
     time_format: TimeFormat,
     zoom_state: &mut ViewerZoomState,
     frame_dimensions: Option<(u32, u32)>,
@@ -89,7 +90,7 @@ pub fn render_viewer(
 
 fn render_single_frame(
     ui: &mut egui::Ui,
-    texture: Option<&egui::TextureHandle>,
+    texture: Option<&FrameTexture>,
     frame_missing: bool,
     current_frame: u32,
     metadata: Option<&VideoMetadata>,
@@ -155,14 +156,14 @@ fn render_single_frame(
 
 fn render_filmstrip(
     ui: &mut egui::Ui,
-    current_texture: Option<&egui::TextureHandle>,
+    current_texture: Option<&FrameTexture>,
     current_frame_missing: bool,
     current_frame: u32,
     total_frames: u32,
     metadata: Option<&VideoMetadata>,
     offset_seconds: f64,
     overlay_pos: &mut egui::Pos2,
-    neighbor_textures: &[(u32, Option<egui::TextureHandle>, bool)],
+    neighbor_textures: &[(u32, Option<FrameTexture>, bool)],
     time_format: TimeFormat,
     zoom_state: &mut ViewerZoomState,
     frame_dimensions: Option<(u32, u32)>,
@@ -186,7 +187,7 @@ fn render_filmstrip(
         .unwrap_or(16.0 / 9.0);
 
     // Build slot lists for left and right grids.
-    let left_slots: Vec<(Option<u32>, Option<&egui::TextureHandle>, bool)> = (1..=before_count)
+    let left_slots: Vec<(Option<u32>, Option<&FrameTexture>, bool)> = (1..=before_count)
         .rev()
         .map(|offset| {
             let idx = current_frame as i64 - offset as i64;
@@ -203,7 +204,7 @@ fn render_filmstrip(
         })
         .collect();
 
-    let right_slots: Vec<(Option<u32>, Option<&egui::TextureHandle>, bool)> = (1..=after_count)
+    let right_slots: Vec<(Option<u32>, Option<&FrameTexture>, bool)> = (1..=after_count)
         .map(|offset| {
             let idx = current_frame as i64 + offset as i64;
             if idx < 0 || idx >= total_frames as i64 {
@@ -532,7 +533,7 @@ fn compute_grid_layout(
 fn render_neighbor_grid(
     painter: &egui::Painter,
     area: &egui::Rect,
-    slots: &[(Option<u32>, Option<&egui::TextureHandle>, bool)],
+    slots: &[(Option<u32>, Option<&FrameTexture>, bool)],
     grid: (usize, usize),
     spacing: f32,
     frame_dimensions: Option<(u32, u32)>,
@@ -574,7 +575,7 @@ fn render_neighbor_grid(
 fn render_grid_cell(
     painter: &egui::Painter,
     cell_rect: &egui::Rect,
-    texture: Option<&egui::TextureHandle>,
+    texture: Option<&FrameTexture>,
     missing: bool,
     frame_idx: Option<u32>,
     frame_dimensions: Option<(u32, u32)>,

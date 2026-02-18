@@ -19,12 +19,19 @@ sha2 = "0.10"
 rfd = "0.15"
 sysinfo = "0.32"
 lz4_flex = "0.11"
+zstd = "0.13"
+intel_tex_2 = "0.5"
+block_compression = { version = "0.8", features = ["wgpu", "bc15", "bc7"] }
+wgpu = "28"
+pollster = "0.4"
+glow = "0.16"
 log = "0.4"
 env_logger = "0.11"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_Graphics_Dxgi", "Win32_Storage_FileSystem"] }
+windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_Storage_FileSystem"] }
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "thin"
+strip = true

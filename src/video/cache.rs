@@ -5,15 +5,53 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use crate::settings::{CacheStorageMode, CompressionAlgorithm};
+
 /// Number of frames around the cursor that are considered essential.
 /// Essential frames can trigger LRU eviction of non-essential frames.
 const ESSENTIAL_RADIUS: i32 = 15;
 
+/// GL format constants for BC compression.
+const GL_COMPRESSED_RGBA_S3TC_DXT1_EXT: i32 = 0x83F1;
+const GL_COMPRESSED_RGBA_BPTC_UNORM: i32 = 0x8E8C;
+
+/// A frame texture ready for rendering. Either managed by egui or a native GL texture.
+#[derive(Clone)]
+pub enum FrameTexture {
+    Managed(egui::TextureHandle),
+    Native {
+        id: egui::TextureId,
+        width: u32,
+        height: u32,
+    },
+}
+
+impl FrameTexture {
+    pub fn id(&self) -> egui::TextureId {
+        match self {
+            Self::Managed(h) => h.id(),
+            Self::Native { id, .. } => *id,
+        }
+    }
+
+    pub fn size_vec2(&self) -> egui::Vec2 {
+        match self {
+            Self::Managed(h) => h.size_vec2(),
+            Self::Native { width, height, .. } => egui::vec2(*width as f32, *height as f32),
+        }
+    }
+}
+
 /// A decoded frame ready to be turned into a GPU texture on the main thread.
-/// The ColorImage is created on the background thread to avoid blocking the UI.
 pub struct DecodedFrame {
     pub frame_index: u32,
     pub color_image: Option<egui::ColorImage>,
+    /// Raw BC compressed data (header-stripped, ready for GL upload).
+    pub bc_data: Option<Vec<u8>>,
+    /// Block-aligned width for BC textures (multiple of 4).
+    pub bc_padded_width: u32,
+    /// Block-aligned height for BC textures (multiple of 4).
+    pub bc_padded_height: u32,
     pub width: u32,
     pub height: u32,
     /// True if the frame file was not found on disk.
@@ -54,10 +92,26 @@ pub struct FrameCache {
     running: Arc<AtomicBool>,
     cache_full: Arc<AtomicBool>,
     prefetch_handle: Option<std::thread::JoinHandle<()>>,
+
+    // Compression settings for frame decoding
+    compression_algorithm: CompressionAlgorithm,
+    cache_storage_mode: CacheStorageMode,
+
+    // Stored egui context for native texture cleanup during eviction/clear
+    egui_ctx: Option<egui::Context>,
+
+    // Stored glow context for direct GL texture deletion.
+    // Native textures registered via `register_native_glow_texture` are NOT tracked
+    // by egui's TextureManager, so `tex_manager.free()` is a no-op for them.
+    // We must call `gl.delete_texture()` directly.
+    gl_context: Option<std::sync::Arc<glow::Context>>,
 }
 
 struct CacheEntry {
-    texture: egui::TextureHandle,
+    texture_handle: Option<egui::TextureHandle>,
+    native_texture_id: Option<egui::TextureId>,
+    /// Raw GL texture handle for direct deletion. Only set for native (BC) textures.
+    gl_texture: Option<glow::Texture>,
     last_access: u64,
     bytes: u64,
 }
@@ -81,19 +135,32 @@ impl FrameCache {
             running: Arc::new(AtomicBool::new(false)),
             cache_full: Arc::new(AtomicBool::new(false)),
             prefetch_handle: None,
+            compression_algorithm: CompressionAlgorithm::default(),
+            cache_storage_mode: CacheStorageMode::default(),
+            egui_ctx: None,
+            gl_context: None,
         }
     }
 
     /// Set GPU memory budget and frame dimensions for budget calculations.
-    pub fn set_gpu_budget(&mut self, gpu_cache_mb: u32, frame_width: u32, frame_height: u32) {
+    pub fn set_gpu_budget(&mut self, gpu_cache_mb: u32, frame_width: u32, frame_height: u32, algo: CompressionAlgorithm) {
         self.gpu_budget_bytes = gpu_cache_mb as u64 * 1024 * 1024;
-        self.frame_bytes = frame_width as u64 * frame_height as u64 * 4;
+        self.frame_bytes = algo.gpu_frame_bytes(frame_width, frame_height);
     }
 
-    /// Set the source directory, total frame count, and frame dimensions.
+    /// Set the source directory, total frame count, frame dimensions, and compression settings.
     /// Clears existing cache and restarts prefetch.
-    pub fn set_source(&mut self, frame_dir: &Path, total_frames: u32, frame_width: u32, frame_height: u32) {
+    pub fn set_source(
+        &mut self,
+        frame_dir: &Path,
+        total_frames: u32,
+        frame_width: u32,
+        frame_height: u32,
+        algo: CompressionAlgorithm,
+        storage_mode: CacheStorageMode,
+    ) {
         self.shutdown_prefetch();
+        self.free_all_native_textures();
         self.textures.clear();
         self.missing_frames.clear();
         self.gpu_cached.write().unwrap().clear();
@@ -104,19 +171,44 @@ impl FrameCache {
         self.total_frames = total_frames;
         self.frame_width = frame_width;
         self.frame_height = frame_height;
+        self.compression_algorithm = algo;
+        self.cache_storage_mode = storage_mode;
 
         if total_frames > 0 && frame_dir.is_dir() {
             self.start_prefetch();
         }
     }
 
-    /// Get the texture for a specific frame. Returns a cloned handle (cheap Arc clone).
-    /// Returns None if not yet loaded.
-    pub fn get_frame(&mut self, frame_index: u32) -> Option<egui::TextureHandle> {
+    /// Number of frames currently loaded in GPU cache.
+    pub fn loaded_frame_count(&self) -> u32 {
+        self.textures.len() as u32
+    }
+
+    /// Whether the GPU cache is full (no more frames can be loaded).
+    pub fn is_cache_full(&self) -> bool {
+        self.cache_full.load(Ordering::Relaxed)
+    }
+
+    /// Total bytes currently cached on the GPU.
+    pub fn cached_bytes(&self) -> u64 {
+        self.cached_bytes
+    }
+
+    /// Get the texture for a specific frame. Returns None if not yet loaded.
+    pub fn get_frame(&mut self, frame_index: u32) -> Option<FrameTexture> {
         if let Some(entry) = self.textures.get_mut(&frame_index) {
             self.access_counter += 1;
             entry.last_access = self.access_counter;
-            return Some(entry.texture.clone());
+            if let Some(handle) = &entry.texture_handle {
+                return Some(FrameTexture::Managed(handle.clone()));
+            }
+            if let Some(id) = entry.native_texture_id {
+                return Some(FrameTexture::Native {
+                    id,
+                    width: self.frame_width,
+                    height: self.frame_height,
+                });
+            }
         }
         None
     }
@@ -134,7 +226,15 @@ impl FrameCache {
     /// essential zone. Non-essential frames are only cached when there is room.
     ///
     /// Returns true if any frames were uploaded or more are pending.
-    pub fn process_uploads(&mut self, ctx: &egui::Context, budget_ms: f64) -> bool {
+    pub fn process_uploads(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame, budget_ms: f64) -> bool {
+        // Store context for later use in eviction/cleanup
+        if self.egui_ctx.is_none() {
+            self.egui_ctx = Some(ctx.clone());
+        }
+        if self.gl_context.is_none() {
+            self.gl_context = frame.gl().cloned();
+        }
+
         // Temporarily take the receiver out of self so we can do mutable
         // operations (eviction, texture insert) while reading from the channel.
         let rx = match self.decoded_rx.take() {
@@ -186,6 +286,58 @@ impl FrameCache {
                         continue;
                     }
 
+                    // BC compressed texture path
+                    if let Some(bc_data) = decoded.bc_data {
+                        let algo = self.compression_algorithm;
+                        let fb = algo.gpu_frame_bytes(decoded.width, decoded.height);
+                        let is_essential =
+                            (decoded.frame_index as i32 - center).unsigned_abs() <= ESSENTIAL_RADIUS as u32;
+
+                        if is_essential {
+                            while self.cached_bytes + fb > self.gpu_budget_bytes {
+                                if self.evict_n_outside(center, 10) == 0 {
+                                    break;
+                                }
+                            }
+                        } else if self.cached_bytes + fb > self.gpu_budget_bytes {
+                            self.cache_full.store(true, Ordering::Relaxed);
+                            continue;
+                        }
+
+                        if let Some(gl) = frame.gl() {
+                            match create_compressed_gl_texture(
+                                gl,
+                                algo,
+                                decoded.bc_padded_width,
+                                decoded.bc_padded_height,
+                                &bc_data,
+                            ) {
+                                Ok(gl_texture) => {
+                                    let tex_id = frame.register_native_glow_texture(gl_texture);
+                                    self.access_counter += 1;
+                                    self.cached_bytes += fb;
+                                    self.textures.insert(
+                                        decoded.frame_index,
+                                        CacheEntry {
+                                            texture_handle: None,
+                                            native_texture_id: Some(tex_id),
+                                            gl_texture: Some(gl_texture),
+                                            last_access: self.access_counter,
+                                            bytes: fb,
+                                        },
+                                    );
+                                    self.gpu_cached.write().unwrap().insert(decoded.frame_index);
+                                    uploaded_any = true;
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to create compressed GL texture for frame {}: {}", decoded.frame_index, e);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Standard RGBA texture path
                     let color_image = match decoded.color_image {
                         Some(img) => img,
                         None => continue,
@@ -196,14 +348,12 @@ impl FrameCache {
                         (decoded.frame_index as i32 - center).unsigned_abs() <= ESSENTIAL_RADIUS as u32;
 
                     if is_essential {
-                        // Essential: evict LRU frames outside ±15 (10 at a time) until there's room
                         while self.cached_bytes + fb > self.gpu_budget_bytes {
                             if self.evict_n_outside(center, 10) == 0 {
-                                break; // Nothing left to evict
+                                break;
                             }
                         }
                     } else {
-                        // Non-essential: only cache if room in budget
                         if self.cached_bytes + fb > self.gpu_budget_bytes {
                             self.cache_full.store(true, Ordering::Relaxed);
                             continue;
@@ -221,7 +371,9 @@ impl FrameCache {
                     self.textures.insert(
                         decoded.frame_index,
                         CacheEntry {
-                            texture,
+                            texture_handle: Some(texture),
+                            native_texture_id: None,
+                            gl_texture: None,
                             last_access: self.access_counter,
                             bytes: fb,
                         },
@@ -262,11 +414,37 @@ impl FrameCache {
         for (key, _) in candidates.into_iter().take(count) {
             if let Some(entry) = self.textures.remove(&key) {
                 self.cached_bytes = self.cached_bytes.saturating_sub(entry.bytes);
+                // For native textures, delete the GL texture directly
+                if let Some(gl_tex) = entry.gl_texture {
+                    if let Some(gl) = &self.gl_context {
+                        use glow::HasContext;
+                        unsafe { gl.delete_texture(gl_tex) };
+                    }
+                }
+                // For managed textures, dropping TextureHandle handles cleanup
             }
             gpu_cached.remove(&key);
             evicted += 1;
         }
         evicted
+    }
+
+    /// Free all native (BC) GL textures directly.
+    ///
+    /// Native textures registered via `register_native_glow_texture` are NOT tracked
+    /// by egui's TextureManager (only the painter knows about them). Calling
+    /// `tex_manager().free()` on a User texture is a silent no-op because the ID
+    /// isn't in the TextureManager's `metas` HashMap. We must call
+    /// `gl.delete_texture()` directly to actually free VRAM.
+    fn free_all_native_textures(&mut self) {
+        use glow::HasContext;
+        if let Some(gl) = &self.gl_context {
+            for entry in self.textures.values() {
+                if let Some(gl_tex) = entry.gl_texture {
+                    unsafe { gl.delete_texture(gl_tex) };
+                }
+            }
+        }
     }
 
     /// Returns true if a prefetch thread is active (frames may arrive).
@@ -277,6 +455,11 @@ impl FrameCache {
     /// Check if a frame is currently cached.
     pub fn is_cached(&self, frame_index: u32) -> bool {
         self.textures.contains_key(&frame_index)
+    }
+
+    /// Number of frames currently cached in GPU memory.
+    pub fn cached_count(&self) -> u32 {
+        self.textures.len() as u32
     }
 
     /// Current frame dimensions used by the cache.
@@ -292,6 +475,7 @@ impl FrameCache {
     /// Shut down the prefetch thread and clear all textures.
     pub fn clear(&mut self) {
         self.shutdown_prefetch();
+        self.free_all_native_textures();
         self.textures.clear();
         self.missing_frames.clear();
         self.gpu_cached.write().unwrap().clear();
@@ -316,6 +500,8 @@ impl FrameCache {
         let total_frames = self.total_frames;
         let frame_width = self.frame_width;
         let frame_height = self.frame_height;
+        let algo = self.compression_algorithm;
+        let storage_mode = self.cache_storage_mode;
 
         let handle = std::thread::Builder::new()
             .name("frame-prefetch".into())
@@ -330,6 +516,8 @@ impl FrameCache {
                     frame_width,
                     frame_height,
                     tx,
+                    algo,
+                    storage_mode,
                 );
             })
             .expect("Failed to spawn prefetch thread");
@@ -347,6 +535,8 @@ impl FrameCache {
         frame_width: u32,
         frame_height: u32,
         tx: mpsc::SyncSender<DecodedFrame>,
+        algo: CompressionAlgorithm,
+        storage_mode: CacheStorageMode,
     ) {
         let num_workers = std::thread::available_parallelism()
             .map(|n| (n.get() * 3 / 4).max(2))
@@ -403,6 +593,8 @@ impl FrameCache {
                         center,
                         &mut sent,
                         num_workers,
+                        algo,
+                        storage_mode,
                     );
                     if aborted {
                         continue;
@@ -442,6 +634,8 @@ impl FrameCache {
                         center,
                         &mut sent,
                         num_workers,
+                        algo,
+                        storage_mode,
                     );
                     // If cache became full or cursor moved, stop forward loading
                     if cache_full.load(Ordering::Relaxed)
@@ -470,6 +664,8 @@ impl FrameCache {
         expected_center: i32,
         sent: &mut HashSet<u32>,
         num_workers: usize,
+        algo: CompressionAlgorithm,
+        storage_mode: CacheStorageMode,
     ) -> bool {
         for chunk in indices.chunks(num_workers) {
             if !running.load(Ordering::Relaxed) {
@@ -484,7 +680,7 @@ impl FrameCache {
                     .iter()
                     .map(|&idx| {
                         let dir = frame_dir;
-                        s.spawn(move || Self::decode_one(dir, idx, frame_width, frame_height))
+                        s.spawn(move || Self::decode_one(dir, idx, frame_width, frame_height, algo, storage_mode))
                     })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -513,6 +709,8 @@ impl FrameCache {
         expected_center: i32,
         sent: &mut HashSet<u32>,
         num_workers: usize,
+        algo: CompressionAlgorithm,
+        storage_mode: CacheStorageMode,
     ) {
         for chunk in indices.chunks(num_workers) {
             if !running.load(Ordering::Relaxed) {
@@ -530,7 +728,7 @@ impl FrameCache {
                     .iter()
                     .map(|&idx| {
                         let dir = frame_dir;
-                        s.spawn(move || Self::decode_one(dir, idx, frame_width, frame_height))
+                        s.spawn(move || Self::decode_one(dir, idx, frame_width, frame_height, algo, storage_mode))
                     })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -545,23 +743,81 @@ impl FrameCache {
         }
     }
 
-    fn decode_one(frame_dir: &Path, idx: u32, frame_width: u32, frame_height: u32) -> DecodedFrame {
+    /// Decode a single frame from disk. Tries raw first if storage mode allows,
+    /// then falls back to compressed. Public for use in benchmark.
+    pub fn decode_one(
+        frame_dir: &Path,
+        idx: u32,
+        frame_width: u32,
+        frame_height: u32,
+        algo: CompressionAlgorithm,
+        storage_mode: CacheStorageMode,
+    ) -> DecodedFrame {
         let fname = format!("frame_{:06}", idx + 1);
-        let raw_path = frame_dir.join("raw").join(format!("{fname}.raw"));
-        let lz4_path = frame_dir.join("lz4").join(format!("{fname}.lz4"));
 
-        // Try uncompressed first (faster, no decompression needed)
-        if let Some(decoded) = Self::decode_raw_frame(&raw_path, idx, frame_width, frame_height) {
-            return decoded;
+        // BC path: read file, strip header, pass through raw BC bytes
+        if algo.is_gpu_compressed() {
+            let ext = crate::video::compression::file_extension(algo);
+            let comp_path = frame_dir.join("compressed").join(format!("{fname}.{ext}"));
+            return match std::fs::read(&comp_path) {
+                Ok(file_data) => {
+                    match crate::video::compression::parse_bc_header(&file_data) {
+                        Some((orig_w, orig_h, bc_data)) => {
+                            let padded_w = (orig_w + 3) & !3;
+                            let padded_h = (orig_h + 3) & !3;
+                            DecodedFrame {
+                                frame_index: idx,
+                                color_image: None,
+                                bc_data: Some(bc_data.to_vec()),
+                                bc_padded_width: padded_w,
+                                bc_padded_height: padded_h,
+                                width: orig_w,
+                                height: orig_h,
+                                missing: false,
+                            }
+                        }
+                        None => Self::missing_frame(idx, frame_width, frame_height),
+                    }
+                }
+                Err(_) => Self::missing_frame(idx, frame_width, frame_height),
+            };
         }
-        // Fall back to compressed
-        Self::decode_lz4_frame(&lz4_path, idx, frame_width, frame_height).unwrap_or(DecodedFrame {
+
+        let expected_len = frame_width as usize * frame_height as usize * 4;
+
+        // Try raw first if storage mode allows
+        if storage_mode.load_raw_first() {
+            let raw_path = frame_dir.join("raw").join(format!("{fname}.raw"));
+            if let Some(decoded) = Self::decode_raw_frame(&raw_path, idx, frame_width, frame_height) {
+                return decoded;
+            }
+        }
+
+        // Try compressed if storage mode allows
+        if storage_mode.load_compressed() {
+            let ext = crate::video::compression::file_extension(algo);
+            let comp_path = frame_dir.join("compressed").join(format!("{fname}.{ext}"));
+            if let Some(decoded) = Self::decode_compressed_frame(
+                &comp_path, idx, frame_width, frame_height, algo, expected_len,
+            ) {
+                return decoded;
+            }
+        }
+
+        Self::missing_frame(idx, frame_width, frame_height)
+    }
+
+    fn missing_frame(idx: u32, frame_width: u32, frame_height: u32) -> DecodedFrame {
+        DecodedFrame {
             frame_index: idx,
             color_image: None,
+            bc_data: None,
+            bc_padded_width: 0,
+            bc_padded_height: 0,
             width: frame_width,
             height: frame_height,
             missing: true,
-        })
+        }
     }
 
     /// Read an uncompressed .raw frame file directly into a ColorImage.
@@ -581,19 +837,28 @@ impl FrameCache {
         Some(DecodedFrame {
             frame_index,
             color_image: Some(color_image),
+            bc_data: None,
+            bc_padded_width: 0,
+            bc_padded_height: 0,
             width: frame_width,
             height: frame_height,
             missing: false,
         })
     }
 
-    /// Read and decompress an LZ4-compressed frame file.
-    fn decode_lz4_frame(path: &Path, frame_index: u32, frame_width: u32, frame_height: u32) -> Option<DecodedFrame> {
+    /// Read and decompress a compressed frame file using the configured algorithm.
+    fn decode_compressed_frame(
+        path: &Path,
+        frame_index: u32,
+        frame_width: u32,
+        frame_height: u32,
+        algo: CompressionAlgorithm,
+        expected_len: usize,
+    ) -> Option<DecodedFrame> {
         let compressed = std::fs::read(path).ok()?;
-        let rgba = lz4_flex::decompress_size_prepended(&compressed).ok()?;
+        let rgba = crate::video::compression::decompress(&compressed, algo, expected_len).ok()?;
 
-        let expected = frame_width as usize * frame_height as usize * 4;
-        if rgba.len() != expected {
+        if rgba.len() != expected_len {
             return None;
         }
 
@@ -605,6 +870,9 @@ impl FrameCache {
         Some(DecodedFrame {
             frame_index,
             color_image: Some(color_image),
+            bc_data: None,
+            bc_padded_width: 0,
+            bc_padded_height: 0,
             width: frame_width,
             height: frame_height,
             missing: false,
@@ -626,25 +894,99 @@ impl Drop for FrameCache {
     }
 }
 
+/// Create a compressed GL texture from BC data using glow.
+fn create_compressed_gl_texture(
+    gl: &std::sync::Arc<glow::Context>,
+    algo: CompressionAlgorithm,
+    width: u32,
+    height: u32,
+    data: &[u8],
+) -> Result<glow::Texture, String> {
+    use glow::HasContext;
+
+    let internal_format = match algo {
+        CompressionAlgorithm::Bc1 => GL_COMPRESSED_RGBA_S3TC_DXT1_EXT,
+        CompressionAlgorithm::Bc7 => GL_COMPRESSED_RGBA_BPTC_UNORM,
+        _ => return Err("Not a BC format".into()),
+    };
+
+    unsafe {
+        let texture = gl.create_texture().map_err(|e| format!("glCreateTexture: {e}"))?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+
+        gl.compressed_tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            internal_format,
+            width as i32,
+            height as i32,
+            0,
+            data.len() as i32,
+            data,
+        );
+
+        // Check for GL error
+        let err = gl.get_error();
+        if err != glow::NO_ERROR {
+            gl.delete_texture(texture);
+            return Err(format!("glCompressedTexImage2D error: 0x{:X}", err));
+        }
+
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+
+        gl.bind_texture(glow::TEXTURE_2D, None);
+
+        Ok(texture)
+    }
+}
+
+/// Check if the GL context supports the required compressed texture extensions.
+pub fn check_bc_support(gl: &glow::Context) -> (bool, bool) {
+    use glow::HasContext;
+    let extensions = gl.supported_extensions();
+    let bc1_ok = extensions.contains("GL_EXT_texture_compression_s3tc")
+        || extensions.contains("GL_S3_s3tc");
+    let bc7_ok = extensions.contains("GL_ARB_texture_compression_bptc");
+    (bc1_ok, bc7_ok)
+}
+
 // --- Disk cache management ---
 
-/// Estimate disk space needed for a video's cache (both lz4 + raw).
-/// Uses a 1.3x multiplier on raw frame size to account for lz4 overhead.
-pub fn estimate_cache_bytes(total_frames: u32, frame_width: u32, frame_height: u32) -> u64 {
+/// Estimate disk space needed for a video's cache.
+pub fn estimate_cache_bytes(
+    total_frames: u32,
+    frame_width: u32,
+    frame_height: u32,
+    storage_mode: CacheStorageMode,
+    algo: CompressionAlgorithm,
+) -> u64 {
+    if algo.is_gpu_compressed() {
+        // BC formats: exact sizes, +8 bytes for header per frame
+        let bc_per_frame = algo.gpu_frame_bytes(frame_width, frame_height) + 8;
+        return total_frames as u64 * bc_per_frame;
+    }
+
     let raw_per_frame = frame_width as u64 * frame_height as u64 * 4;
-    // raw files + lz4 files (~30% of raw size)
-    total_frames as u64 * raw_per_frame * 13 / 10
+    match storage_mode {
+        CacheStorageMode::CompressedOnly => total_frames as u64 * raw_per_frame * 3 / 10,
+        CacheStorageMode::RawOnly => total_frames as u64 * raw_per_frame,
+        CacheStorageMode::Both => total_frames as u64 * raw_per_frame * 13 / 10,
+    }
 }
 
 /// Proactively evict caches before extraction starts so the new video will fit.
 /// Evicts until (current_cache_size + estimated_new) <= disk_limit * 110%.
-/// Uses two-tier eviction: raw/ subdirs first, then entire video dirs.
+/// Uses two-tier eviction: expendable subdirs first, then entire video dirs.
 /// Never evicts the directory identified by `current_sha`.
 pub fn evict_for_new_video(
     cache_root: &Path,
     max_size_mb: u32,
     current_sha: &str,
     estimated_new_bytes: u64,
+    storage_mode: CacheStorageMode,
 ) {
     let budget = max_size_mb as u64 * 1024 * 1024 * 11 / 10; // 110% of limit
 
@@ -656,9 +998,16 @@ pub fn evict_for_new_video(
     struct CacheDir {
         path: PathBuf,
         name: String,
-        raw_size: u64,
+        expendable_size: u64,
+        expendable_subdir: &'static str,
         access_time: u64,
     }
+
+    // Determine which subdir is expendable based on storage mode
+    let expendable_name = match storage_mode {
+        CacheStorageMode::Both | CacheStorageMode::CompressedOnly => "raw",
+        CacheStorageMode::RawOnly => "compressed",
+    };
 
     let mut dirs: Vec<CacheDir> = Vec::new();
     let mut total_size = 0u64;
@@ -670,11 +1019,11 @@ pub fn evict_for_new_video(
         }
         let name = entry.file_name().to_string_lossy().to_string();
         let size = get_dir_size(&path);
-        let raw_dir = path.join("raw");
-        let raw_size = if raw_dir.is_dir() { get_dir_size(&raw_dir) } else { 0 };
+        let expendable_dir = path.join(expendable_name);
+        let expendable_size = if expendable_dir.is_dir() { get_dir_size(&expendable_dir) } else { 0 };
         let access_time = read_cache_access_time(&path);
         total_size += size;
-        dirs.push(CacheDir { path, name, raw_size, access_time });
+        dirs.push(CacheDir { path, name, expendable_size, expendable_subdir: expendable_name, access_time });
     }
 
     if total_size + estimated_new_bytes <= budget {
@@ -691,20 +1040,20 @@ pub fn evict_for_new_video(
     // Sort by access time ascending (oldest first) for LRU eviction
     dirs.sort_by_key(|d| d.access_time);
 
-    // Phase 1: Remove raw/ subdirs from non-current caches
+    // Phase 1: Remove expendable subdirs from non-current caches
     for dir in &dirs {
         if total_size + estimated_new_bytes <= budget {
             break;
         }
-        if dir.name == current_sha || dir.raw_size == 0 {
+        if dir.name == current_sha || dir.expendable_size == 0 {
             continue;
         }
-        let raw_dir = dir.path.join("raw");
-        log::info!("Evicting raw cache: {} ({} MB)", dir.name, dir.raw_size / (1024 * 1024));
-        if let Err(e) = std::fs::remove_dir_all(&raw_dir) {
-            log::warn!("Failed to remove raw cache dir {}: {e}", raw_dir.display());
+        let sub_dir = dir.path.join(dir.expendable_subdir);
+        log::info!("Evicting {} cache: {} ({} MB)", dir.expendable_subdir, dir.name, dir.expendable_size / (1024 * 1024));
+        if let Err(e) = std::fs::remove_dir_all(&sub_dir) {
+            log::warn!("Failed to remove {} cache dir {}: {e}", dir.expendable_subdir, sub_dir.display());
         } else {
-            total_size -= dir.raw_size;
+            total_size -= dir.expendable_size;
         }
     }
 
@@ -767,7 +1116,7 @@ fn read_cache_access_time(video_cache_dir: &Path) -> u64 {
 }
 
 /// Enforce disk cache size limit with two-tier eviction:
-/// 1. First remove `raw/` (uncompressed) subdirs from non-current video caches (LRU order)
+/// 1. First remove expendable subdirs from non-current video caches (LRU order)
 /// 2. If still over budget, remove entire video cache directories (LRU order)
 /// The directory identified by `current_sha` is never evicted.
 ///
@@ -776,6 +1125,7 @@ pub fn manage_disk_cache(
     cache_root: &Path,
     max_size_mb: u32,
     current_sha: &str,
+    storage_mode: CacheStorageMode,
 ) -> Result<(), String> {
     let max_bytes = max_size_mb as u64 * 1024 * 1024;
 
@@ -785,10 +1135,16 @@ pub fn manage_disk_cache(
         Err(_) => return Ok(()),
     };
 
+    let expendable_name = match storage_mode {
+        CacheStorageMode::Both | CacheStorageMode::CompressedOnly => "raw",
+        CacheStorageMode::RawOnly => "compressed",
+    };
+
     struct CacheDir {
         path: PathBuf,
         name: String,
-        raw_size: u64,
+        expendable_size: u64,
+        expendable_subdir: &'static str,
         access_time: u64,
     }
 
@@ -802,11 +1158,11 @@ pub fn manage_disk_cache(
         }
         let name = entry.file_name().to_string_lossy().to_string();
         let total = get_dir_size(&path);
-        let raw_dir = path.join("raw");
-        let raw_size = if raw_dir.is_dir() { get_dir_size(&raw_dir) } else { 0 };
+        let expendable_dir = path.join(expendable_name);
+        let expendable_size = if expendable_dir.is_dir() { get_dir_size(&expendable_dir) } else { 0 };
         let access_time = read_cache_access_time(&path);
         total_size += total;
-        dirs.push(CacheDir { path, name, raw_size, access_time });
+        dirs.push(CacheDir { path, name, expendable_size, expendable_subdir: expendable_name, access_time });
     }
 
     if total_size <= max_bytes {
@@ -816,20 +1172,20 @@ pub fn manage_disk_cache(
     // Sort by access time ascending (oldest first) for LRU eviction
     dirs.sort_by_key(|d| d.access_time);
 
-    // Phase 1: Remove uncompressed (raw/) subdirs from non-current caches
+    // Phase 1: Remove expendable subdirs from non-current caches
     for dir in &dirs {
         if total_size <= max_bytes {
             break;
         }
-        if dir.name == current_sha || dir.raw_size == 0 {
+        if dir.name == current_sha || dir.expendable_size == 0 {
             continue;
         }
-        let raw_dir = dir.path.join("raw");
-        log::info!("Evicting raw cache: {} ({} MB)", dir.name, dir.raw_size / (1024 * 1024));
-        if let Err(e) = std::fs::remove_dir_all(&raw_dir) {
-            log::warn!("Failed to remove raw cache dir {}: {e}", raw_dir.display());
+        let sub_dir = dir.path.join(dir.expendable_subdir);
+        log::info!("Evicting {} cache: {} ({} MB)", dir.expendable_subdir, dir.name, dir.expendable_size / (1024 * 1024));
+        if let Err(e) = std::fs::remove_dir_all(&sub_dir) {
+            log::warn!("Failed to remove {} cache dir {}: {e}", dir.expendable_subdir, sub_dir.display());
         } else {
-            total_size -= dir.raw_size;
+            total_size -= dir.expendable_size;
         }
     }
 
@@ -837,7 +1193,7 @@ pub fn manage_disk_cache(
         return Ok(());
     }
 
-    // Phase 2: Remove entire video cache directories (compressed + everything)
+    // Phase 2: Remove entire video cache directories
     for dir in &dirs {
         if total_size <= max_bytes {
             break;
@@ -845,7 +1201,6 @@ pub fn manage_disk_cache(
         if dir.name == current_sha {
             continue;
         }
-        // raw/ may already be removed in phase 1; use remaining size
         let remaining = get_dir_size(&dir.path);
         log::info!("Evicting cache directory: {} ({} MB)", dir.name, remaining / (1024 * 1024));
         if let Err(e) = std::fs::remove_dir_all(&dir.path) {
@@ -867,20 +1222,30 @@ pub fn manage_disk_cache(
     Ok(())
 }
 
-/// Decompress all LZ4 frames in a cache directory to raw files.
+/// Decompress all compressed frames in a cache directory to raw files.
 /// Spawns a background thread. The cancel flag can be set to abort.
 /// Returns a handle to the decompression thread.
 pub fn decompress_cache_async(
     cache_dir: PathBuf,
     cancel: Arc<AtomicBool>,
+    algo: CompressionAlgorithm,
+    frame_width: u32,
+    frame_height: u32,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("cache-decompress".into())
         .spawn(move || {
-            let lz4_dir = cache_dir.join("lz4");
-            let raw_dir = cache_dir.join("raw");
+            // BC formats are GPU-native; no decompression to raw needed
+            if algo.is_gpu_compressed() {
+                return;
+            }
 
-            if !lz4_dir.is_dir() {
+            let compressed_dir = cache_dir.join("compressed");
+            let raw_dir = cache_dir.join("raw");
+            let ext = crate::video::compression::file_extension(algo);
+            let expected_len = frame_width as usize * frame_height as usize * 4;
+
+            if !compressed_dir.is_dir() {
                 return;
             }
             if let Err(e) = std::fs::create_dir_all(&raw_dir) {
@@ -888,17 +1253,17 @@ pub fn decompress_cache_async(
                 return;
             }
 
-            // Collect lz4 files to decompress
-            let mut lz4_files: Vec<PathBuf> = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&lz4_dir) {
+            // Collect compressed files to decompress
+            let mut comp_files: Vec<PathBuf> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(&compressed_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if path.extension().is_some_and(|ext| ext == "lz4") {
-                        lz4_files.push(path);
+                    if path.extension().is_some_and(|e| e == ext) {
+                        comp_files.push(path);
                     }
                 }
             }
-            lz4_files.sort();
+            comp_files.sort();
 
             let num_workers = std::thread::available_parallelism()
                 .map(|n| (n.get() * 3 / 4).max(2))
@@ -906,13 +1271,14 @@ pub fn decompress_cache_async(
                 .min(12);
 
             log::info!(
-                "Decompressing {} frames to raw cache ({} workers)",
-                lz4_files.len(),
+                "Decompressing {} frames to raw cache ({} workers, algo={})",
+                comp_files.len(),
                 num_workers,
+                algo.label(),
             );
 
             let mut decompressed = 0u32;
-            for chunk in lz4_files.chunks(num_workers) {
+            for chunk in comp_files.chunks(num_workers) {
                 if cancel.load(Ordering::Relaxed) {
                     log::info!("Raw cache decompression cancelled");
                     return;
@@ -921,10 +1287,10 @@ pub fn decompress_cache_async(
                 std::thread::scope(|s| {
                     let handles: Vec<_> = chunk
                         .iter()
-                        .map(|lz4_path| {
+                        .map(|comp_path| {
                             let raw_d = &raw_dir;
                             s.spawn(move || {
-                                let stem = lz4_path.file_stem().unwrap_or_default();
+                                let stem = comp_path.file_stem().unwrap_or_default();
                                 let raw_path = raw_d.join(format!("{}.raw", stem.to_string_lossy()));
 
                                 // Skip if already decompressed
@@ -932,8 +1298,10 @@ pub fn decompress_cache_async(
                                     return;
                                 }
 
-                                if let Ok(compressed) = std::fs::read(lz4_path) {
-                                    if let Ok(raw) = lz4_flex::decompress_size_prepended(&compressed) {
+                                if let Ok(compressed_data) = std::fs::read(comp_path) {
+                                    if let Ok(raw) = crate::video::compression::decompress(
+                                        &compressed_data, algo, expected_len,
+                                    ) {
                                         let _ = std::fs::write(&raw_path, &raw);
                                     }
                                 }
